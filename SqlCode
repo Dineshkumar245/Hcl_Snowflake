@@ -1,0 +1,329 @@
+-- ==============================================
+-- 1. DATABASE AND SCHEMA SETUP
+-- ==============================================
+CREATE DATABASE EDTECH_DB;
+
+USE DATABASE EDTECH_DB;
+
+CREATE SCHEMA RAW;
+CREATE SCHEMA ANALYTICS;
+
+-- ==============================================
+-- 2. RAW TABLE CREATION
+-- ==============================================
+
+-- Student master table
+CREATE OR REPLACE TABLE RAW.STUDENT (
+    studentId INT,
+    studentName STRING,
+    email STRING,
+    courseCategory STRING,
+    enrollmentStatus STRING
+);
+
+-- Course catalog table
+CREATE OR REPLACE TABLE RAW.COURSE (
+    courseId INT,
+    courseName STRING,
+    instructorName STRING,
+    difficultyLevel STRING,
+    courseDuration INT
+);
+
+-- Learning activity log table
+CREATE OR REPLACE TABLE RAW.LEARNING_ACTIVITY (
+    activityId INT,
+    studentId INT,
+    courseId INT,
+    activityType STRING,
+    activityTimestamp TIMESTAMP
+);
+
+-- Assessment results table
+CREATE OR REPLACE TABLE RAW.ASSESSMENT (
+    assessmentId INT,
+    studentId INT,
+    assessmentScore NUMBER,
+    assessmentDate DATE,
+    resultStatus STRING
+);
+
+-- Engagement alert table
+CREATE OR REPLACE TABLE RAW.ENGAGEMENT_ALERT (
+    alertId INT,
+    studentId INT,
+    engagementScore NUMBER,
+    alertReason STRING,
+    alertStatus STRING
+);
+
+-- ==============================================
+-- 3. STAGE AND FILE FORMAT SETUP
+-- ==============================================
+
+-- Internal stage for loading data files
+CREATE STAGE EDTECH_STAGE;
+
+-- CSV file format with header skip and quoted fields
+CREATE OR REPLACE FILE FORMAT CSV_FORMAT
+TYPE = CSV
+SKIP_HEADER = 1
+FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+-- JSON file format for semi-structured data
+CREATE OR REPLACE FILE FORMAT JSON_FORMAT
+TYPE = JSON;
+
+-- ==============================================
+-- 4. DATA LOADING (COPY INTO)
+-- ==============================================
+
+-- Load student data from CSV
+COPY INTO RAW.STUDENT
+FROM @EDTECH_STAGE/students.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FORMAT);
+
+-- Load course data from CSV
+COPY INTO RAW.COURSE
+FROM @EDTECH_STAGE/course.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FORMAT);
+
+-- Load learning activity data from CSV
+COPY INTO RAW.LEARNING_ACTIVITY
+FROM @EDTECH_STAGE/activity.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FORMAT);
+
+-- Load assessment data from CSV
+COPY INTO RAW.ASSESSMENT
+FROM @EDTECH_STAGE/assessment.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FORMAT);
+
+-- Load engagement alert data from CSV
+COPY INTO RAW.ENGAGEMENT_ALERT
+FROM @EDTECH_STAGE/alert.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FORMAT);
+
+-- ==============================================
+-- 5. CONSTRAINTS (added after data load)
+-- ==============================================
+
+-- Ensure assessment scores are between 0 and 100
+ALTER TABLE RAW.ASSESSMENT
+ADD CONSTRAINT score_check
+CHECK (assessmentScore BETWEEN 0 AND 100) ENABLE NOVALIDATE;
+
+-- ==============================================
+-- 6. SEMI-STRUCTURED DATA (JSON)
+-- ==============================================
+
+-- Table to hold raw JSON activity data
+CREATE OR REPLACE TABLE RAW.JSON_ACTIVITY (
+    data VARIANT
+);
+
+-- Load JSON activity data
+COPY INTO RAW.JSON_ACTIVITY
+FROM @EDTECH_STAGE/activity.json
+FILE_FORMAT = (FORMAT_NAME = JSON_FORMAT);
+
+-- Query semi-structured JSON data using dot notation
+SELECT
+    data:studentId::INT AS student_id,
+    data:device::STRING AS device_used,
+    data:browser::STRING AS browser_used
+FROM RAW.JSON_ACTIVITY;
+
+-- ==============================================
+-- 7. ANALYTICS LAYER (DIMENSION & FACT TABLES)
+-- ==============================================
+
+-- Dimension table for students
+CREATE OR REPLACE TABLE ANALYTICS.DIM_STUDENT AS
+SELECT DISTINCT
+    studentId,
+    studentName,
+    courseCategory,
+    enrollmentStatus
+FROM RAW.STUDENT;
+
+-- Dimension table for courses
+CREATE OR REPLACE TABLE ANALYTICS.DIM_COURSE AS
+SELECT DISTINCT
+    courseId,
+    courseName,
+    instructorName,
+    difficultyLevel,
+    courseDuration
+FROM RAW.COURSE;
+
+-- Fact table for learning activities
+CREATE OR REPLACE TABLE ANALYTICS.FACT_ACTIVITY AS
+SELECT
+    activityId,
+    studentId,
+    courseId,
+    activityType,
+    activityTimestamp
+FROM RAW.LEARNING_ACTIVITY;
+
+-- ==============================================
+-- 8. STREAM (Change Data Capture)
+-- ==============================================
+
+-- Stream to capture new inserts/updates on learning activity
+CREATE OR REPLACE STREAM activity_stream
+ON TABLE RAW.LEARNING_ACTIVITY;
+
+-- Insert a test record to generate stream data
+INSERT INTO RAW.LEARNING_ACTIVITY
+VALUES (
+    9999,
+    101,
+    1,
+    'Quiz Attempted',
+    CURRENT_TIMESTAMP()
+);
+
+-- ==============================================
+-- 9. TASK (Scheduled Data Pipeline)
+-- ==============================================
+
+-- Task to incrementally load new activities into the fact table every 5 minutes
+CREATE OR REPLACE TASK activity_task
+WAREHOUSE = EDTECH_WH
+SCHEDULE = '5 MINUTE'
+AS
+INSERT INTO ANALYTICS.FACT_ACTIVITY
+SELECT
+    activityId,
+    studentId,
+    courseId,
+    activityType,
+    activityTimestamp
+FROM activity_stream;
+
+-- Resume the task to start scheduling
+ALTER TASK activity_task RESUME;
+SHOW TASKS;
+
+-- ==============================================
+-- 10. DYNAMIC TABLE (Auto-Refreshing Aggregation)
+-- ==============================================
+
+-- Dynamic table that auto-refreshes student engagement counts
+CREATE OR REPLACE DYNAMIC TABLE ANALYTICS.DT_ENGAGEMENT
+TARGET_LAG = '5 minutes'
+WAREHOUSE = EDTECH_WH
+AS
+SELECT
+    studentId,
+    COUNT(activityId) AS total_activities
+FROM RAW.LEARNING_ACTIVITY
+GROUP BY studentId;
+
+-- ==============================================
+-- 11. ANALYTICAL QUERIES
+-- ==============================================
+
+-- Join students, courses, and activities to see full activity details
+SELECT
+    s.studentName,
+    c.courseName,
+    a.activityType
+FROM RAW.LEARNING_ACTIVITY a
+JOIN RAW.STUDENT s
+ON a.studentId = s.studentId
+JOIN RAW.COURSE c
+ON a.courseId = c.courseId;
+
+-- Count total students per course
+SELECT
+    courseId,
+    COUNT(studentId) AS total_students
+FROM RAW.LEARNING_ACTIVITY
+GROUP BY courseId;
+
+-- ==============================================
+-- 12. VIEWS
+-- ==============================================
+
+-- View: student activity details with names
+CREATE OR REPLACE VIEW ANALYTICS.VW_STUDENT_ACTIVITY AS
+SELECT
+    s.studentName,
+    c.courseName,
+    a.activityType,
+    a.activityTimestamp
+FROM RAW.LEARNING_ACTIVITY a
+JOIN RAW.STUDENT s
+ON a.studentId = s.studentId
+JOIN RAW.COURSE c
+ON a.courseId = c.courseId;
+
+-- ==============================================
+-- 13. ROLE-BASED ACCESS CONTROL
+-- ==============================================
+
+-- Create analyst role and grant read access to analytics schema
+CREATE ROLE ANALYST_ROLE;
+GRANT USAGE ON DATABASE EDTECH_DB TO ROLE ANALYST_ROLE;
+GRANT USAGE ON SCHEMA ANALYTICS TO ROLE ANALYST_ROLE;
+GRANT SELECT ON ALL TABLES IN SCHEMA ANALYTICS TO ROLE ANALYST_ROLE;
+
+-- ==============================================
+-- 14. AGGREGATE VIEW (Replaces Materialized View for Standard Edition)
+-- ==============================================
+
+-- View: total activities per course
+CREATE OR REPLACE VIEW ANALYTICS.MV_COURSE_ACTIVITY AS
+SELECT
+    courseId,
+    COUNT(*) AS total_activities
+FROM RAW.LEARNING_ACTIVITY
+GROUP BY courseId;
+
+-- ==============================================
+-- 15. DATA MASKING VIEW (Alternative to Masking Policy for Standard Edition)
+-- ==============================================
+
+-- View: masks student email addresses
+CREATE OR REPLACE VIEW ANALYTICS.VW_MASKED_STUDENT AS
+SELECT
+    studentId,
+    studentName,
+    CONCAT('*****', RIGHT(email, 10)) AS masked_email,
+    courseCategory,
+    enrollmentStatus
+FROM RAW.STUDENT;
+
+-- ==============================================
+-- 16. LOW ENGAGEMENT & INACTIVE STUDENT QUERIES
+-- ==============================================
+
+-- Find students with fewer than 3 activities (low engagement)
+SELECT
+    studentId,
+    COUNT(activityId) AS total_activities
+FROM RAW.LEARNING_ACTIVITY
+GROUP BY studentId
+HAVING COUNT(activityId) < 3;
+
+-- Find inactive students
+SELECT *
+FROM RAW.STUDENT
+WHERE enrollmentStatus = 'Inactive';
+
+CREATE OR REPLACE PIPE activity_pipe
+AUTO_INGEST = FALSE
+AS
+COPY INTO RAW.LEARNING_ACTIVITY
+FROM @EDTECH_STAGE/activity.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FORMAT);
+
+DELETE FROM RAW.STUDENT
+WHERE studentId = 1;
+select * FROM Raw.STUDENT where studentId=1;
+SELECT *
+FROM RAW.STUDENT
+AT (OFFSET => -60*5);
+
